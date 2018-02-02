@@ -3,15 +3,6 @@
 set -eu
 set -o pipefail
 
-# Sourced from:
-# - https://github.com/LnL7/nix-darwin/blob/8c29d0985d74b4a990238497c47a2542a5616b3c/bootstrap.sh
-# - https://gist.github.com/expipiplus1/e571ce88c608a1e83547c918591b149f/ac504c6c1b96e65505fbda437a28ce563408ecb0
-# - https://github.com/NixOS/nixos-org-configurations/blob/a122f418797713d519aadf02e677fce0dc1cb446/delft/scripts/nix-mac-installer.sh
-# - https://github.com/matthewbauer/macNixOS/blob/f6045394f9153edea417be90c216788e754feaba/install-macNixOS.sh
-# - https://gist.github.com/LnL7/9717bd6cdcb30b086fd7f2093e5f8494/86b26f852ce563e973acd30f796a9a416248c34a
-#
-# however tracking which bits came from which would be impossible.
-
 readonly ESC='\033[0m'
 readonly BOLD='\033[38;1m'
 readonly BLUE='\033[38;34m'
@@ -23,7 +14,23 @@ readonly RED_UL='\033[38;4;31m'
 readonly YELLOW='\033[38;33m'
 readonly YELLOW_UL='\033[38;4;33m'
 
-readonly CORES=$(sysctl -n hw.ncpu)
+
+oops() {
+    echo "$0:" "$@" >&2
+    exit 1
+}
+
+require_util() {
+    type "$1" > /dev/null 2>&1 || which "$1" > /dev/null 2>&1 ||
+        oops "you do not have '$1' installed, which I need to $2"
+}
+
+require_util nproc "number of cores"
+require_util rsync "copy files"
+require_util systemctl ""
+
+
+readonly CORES=$(nproc --all)
 readonly NIX_USER_COUNT="$CORES"
 readonly NIX_BUILD_GROUP_ID="30000"
 readonly NIX_BUILD_GROUP_NAME="nixbld"
@@ -31,15 +38,15 @@ readonly NIX_FIRST_BUILD_UID="30001"
 # Please don't change this. We don't support it, because the
 # default shell profile that comes with Nix doesn't support it.
 readonly NIX_ROOT="/nix"
-readonly PLIST_DEST=/Library/LaunchDaemons/org.nixos.nix-daemon.plist
 
-readonly PROFILE_TARGETS=("/etc/profile" "/etc/bashrc" "/etc/zshrc")
+readonly PROFILE_TARGETS=("/etc/profile" "/etc/bashrc")
 readonly PROFILE_BACKUP_SUFFIX=".backup-before-nix"
 readonly PROFILE_NIX_FILE="$NIX_ROOT/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"
 
 readonly NIX_INSTALLED_NIX="/nix/store/gy4yv67gv3j6in0lalw37j353zdmfcwm-nix-1.11.16"
 readonly NIX_INSTALLED_CACERT="/nix/store/317cmf8j8s2x7ihwy66zs0xjsjxzrpc4-nss-cacert-3.32.1"
 readonly EXTRACTED_NIX_PATH="$(dirname "$0")"
+readonly NIX_SERVICE_CONFIG="/etc/systemd/system/nix.service"
 
 readonly ROOT_HOME="/var/root"
 
@@ -71,13 +78,14 @@ uninstall_directions() {
     subheader "Uninstalling nix:"
     local step=0
 
-    if [ -e "$PLIST_DEST" ]; then
+    if [ -e "$NIX_SERVICE_CONFIG" ]; then
         step=$((step + 1))
         cat <<EOF
-$step. Delete $PLIST_DEST
+$step. Delete $NIX_SERVICE_CONFIG
 
-  sudo launchctl unload $PLIST_DEST
-  sudo rm $PLIST_DEST
+  sudo systemctl stop nix
+  sudo systemctl disable nix
+  sudo rm NIX_SERVICE_CONFIG
 
 EOF
     fi
@@ -117,10 +125,6 @@ nix_uid_for_core() {
     echo $((NIX_FIRST_BUILD_UID + $1 - 1))
 }
 
-dsclattr() {
-    /usr/bin/dscl . -read "$1" \
-        | awk "/$2/ { print \$2 }"
-}
 
 _textout() {
     echo -en "$1"
@@ -280,10 +284,6 @@ EOF
 
 
 validate_starting_assumptions() {
-    if [ "$(uname -s)" != "Darwin" ]; then
-        failure "This script is for use with macOS!"
-    fi
-
     if [ $EUID -eq 0 ]; then
         failure <<EOF
 Please do not run this script with root privileges. We will call sudo
@@ -305,9 +305,6 @@ EOF
 Nix seems to be partially installed, because the nix-daemon is
 currently running. It may be in a launchd service. Please stop the
 the old nix-daemon, and try again.
-
-If you have an existing launchd plist for nix-daemon, please delete
-it.
 
 $(uninstall_directions)
 EOF
@@ -402,12 +399,14 @@ and try again.
 EOF
         fi
 
-        if grep -qi "nix" "$profile_target"; then
-            failure <<EOF
+        if [ -e $profile_target ]; then
+            if grep -qi "nix" "$profile_target"; then
+                failure <<EOF
 It looks like $profile_target already has some Nix configuration in
 there. There should be no reason to run this again. If you're having
 trouble, please open an issue.
 EOF
+            fi
         fi
     done
 
@@ -449,27 +448,25 @@ setup_report() {
 }
 
 create_build_group() {
-    local primary_group_id
+    local group_id
 
     task "Setting up the build group $NIX_BUILD_GROUP_NAME"
-    if ! /usr/bin/dscl . -read "/Groups/$NIX_BUILD_GROUP_NAME" > /dev/null 2>&1; then
+
+    if ! grep -q "^$NIX_BUILD_GROUP_NAME:" /etc/group; then
         _sudo "Create the Nix build group, $NIX_BUILD_GROUP_NAME" \
-              /usr/sbin/dseditgroup -o create \
-              -r "Nix build group for nix-daemon" \
-              -i "$NIX_BUILD_GROUP_ID" \
-              "$NIX_BUILD_GROUP_NAME" >&2
+            groupadd -g "$NIX_BUILD_GROUP_ID" "$NIX_BUILD_GROUP_NAME"
         row "            Created" "Yes"
     else
-        primary_group_id=$(dsclattr "/Groups/$NIX_BUILD_GROUP_NAME" "PrimaryGroupID")
-        if [ "$primary_group_id" -ne "$NIX_BUILD_GROUP_ID" ]; then
+        group_id=`grep "^$NIX_BUILD_GROUP_NAME:"  /etc/group | awk -F':' '{print $3}'`
+        if [ "$group_id" -ne "$NIX_BUILD_GROUP_ID" ]; then
             failure <<EOF
 It seems the build group $NIX_BUILD_GROUP_NAME already exists, but
-with the UID $primary_group_id. This script can't really handle
+with the UID $group_id. This script can't really handle
 that right now, so I'm going to give up.
 
 You can fix this by editing this script and changing the
 NIX_BUILD_GROUP_ID variable near the top to from $NIX_BUILD_GROUP_ID
-to $primary_group_id and re-run.
+to $group_id and re-run.
 EOF
         else
             row "            Exists" "Yes"
@@ -485,17 +482,16 @@ create_build_user_for_core() {
     coreid="$1"
     username=$(nix_user_for_core "$coreid")
     uid=$(nix_uid_for_core "$coreid")
-    dsclpath="/Users/$username"
 
     task "Setting up the build user $username"
 
-    if ! /usr/bin/dscl . -read "$dsclpath" > /dev/null 2>&1; then
+    if ! grep -q "$username" /etc/passwd; then
         _sudo "Creating the Nix build user, $username" \
-              /usr/bin/dscl . create "$dsclpath" \
-              UniqueID "${uid}"
-        row "           Created" "Yes"
+            useradd -c "Nix build user $coreid" -d /ver/empty \
+                -g $NIX_BUILD_GROUP_NAME -G $NIX_BUILD_GROUP_NAME \
+                -M -N -r -s $(which nologin) $username
     else
-        actual_uid=$(dsclattr "$dsclpath" "UniqueID")
+        actual_uid=`grep "^$username" /etc/passwd | awk -F':' '{print $3}'`
         if [ "$actual_uid" -ne "$uid" ]; then
             failure <<EOF
 It seems the build user $username already exists, but with the UID
@@ -510,57 +506,6 @@ EOF
         else
             row "            Exists" "Yes"
         fi
-    fi
-
-    if [ "$(dsclattr "$dsclpath" "IsHidden")" = "1" ]; then
-        row "          IsHidden" "Yes"
-    else
-        _sudo "in order to make $username a hidden user" \
-              /usr/bin/dscl . -create "$dsclpath" "IsHidden" "1"
-        row "          IsHidden" "Yes"
-    fi
-
-    if [ "$(dsclattr "$dsclpath" "NFSHomeDirectory")" = "/var/empty" ]; then
-        row "          NFSHomeDirectory" "/var/empty"
-    else
-        _sudo "in order to give $username a safe home directory" \
-              /usr/bin/dscl . -create "$dsclpath" "NFSHomeDirectory" "/var/empty"
-        row "          NFSHomeDirectory" "/var/empty"
-    fi
-
-    if [ "$(dsclattr "$dsclpath" "RealName")" = "Nix build user $coreid" ]; then
-        row "          RealName" "Nix build user $coreid"
-    else
-        _sudo "in order to give $username a useful name" \
-              /usr/bin/dscl . -create "$dsclpath" "RealName" "Nix build user $coreid"
-        row "          RealName" "Nix build user $coreid"
-    fi
-
-    if [ "$(dsclattr "$dsclpath" "UserShell")" = "/sbin/nologin" ]; then
-        row "   Logins Disabled" "Yes"
-    else
-        _sudo "in order to prevent $username from logging in" \
-              /usr/bin/dscl . -create "$dsclpath" "UserShell" "/sbin/nologin"
-        row "   Logins Disabled" "Yes"
-    fi
-
-    if dseditgroup -o checkmember -m "$username" "$NIX_BUILD_GROUP_NAME" > /dev/null 2>&1 ; then
-        row "  Member of $NIX_BUILD_GROUP_NAME" "Yes"
-    else
-        _sudo "Add $username to the $NIX_BUILD_GROUP_NAME group"\
-            /usr/sbin/dseditgroup -o edit -t user \
-            -a "$username" "$NIX_BUILD_GROUP_NAME"
-        row "  Member of $NIX_BUILD_GROUP_NAME" "Yes"
-    fi
-
-    if [ "$(dsclattr "$dsclpath" "PrimaryGroupID")" = "$NIX_BUILD_GROUP_ID" ]; then
-        row "    PrimaryGroupID" "$NIX_BUILD_GROUP_ID"
-    else
-        _sudo "to let the nix daemon use this user for builds (this might seem redundant, but there are two concepts of group membership)" \
-              /usr/bin/dscl . -create "$dsclpath" "PrimaryGroupID" "$NIX_BUILD_GROUP_ID"
-        row "    PrimaryGroupID" "$NIX_BUILD_GROUP_ID"
-
-    fi
 }
 
 create_build_users() {
@@ -647,7 +592,7 @@ EOF
             fi
         done
         cat <<EOF
- - load and start a LaunchDaemon (at $PLIST_DEST) for nix-daemon
+ - create nix.service, enable and start nix-daemon
 
 EOF
         if ! ui_confirm "Ready to continue?"; then
@@ -792,15 +737,28 @@ EOF
           install -m 0664 "$SCRATCH/nix.conf" /etc/nix/nix.conf
 }
 
-configure_nix_daemon_plist() {
-    _sudo "to set up the nix-daemon as a LaunchDaemon" \
-          ln -sfn "/nix/var/nix/profiles/default$PLIST_DEST" "$PLIST_DEST"
+configure_nix_daemon_systemd() {
+    cat <<EOF > $SCRATCH/nix.service
+[Unit]
+Description=Nix daemon
 
-    _sudo "to load the LaunchDaemon plist for nix-daemon" \
-          launchctl load /Library/LaunchDaemons/org.nixos.nix-daemon.plist
+[Service]
+Environment=SSL_CERT_FILE=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt
+ExecStart=/nix/var/nix/profiles/default/bin/nix-daemon $EXTRA_OPTS
+IgnoreSIGPIPE=false
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    _sudo "copy nix.service service configuration file" \
+          rsync "$SCRATCH/nix.service" /etc/systemd/system/nix.service
+
+    _sudo "to enable the nix-daemon" \
+          systemctl enable nix
 
     _sudo "to start the nix-daemon" \
-          launchctl start org.nixos.nix-daemon
+          systemctl start nix
 
 }
 
@@ -836,7 +794,7 @@ main() {
 
     setup_default_profile
     place_nix_configuration
-    configure_nix_daemon_plist
+    configure_nix_daemon_systemd
 
     trap finish_success EXIT
 }
