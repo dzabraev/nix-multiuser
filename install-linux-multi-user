@@ -489,7 +489,7 @@ create_build_user_for_core() {
         _sudo "Creating the Nix build user, $username" \
             useradd -c "Nix build user $coreid" -d /ver/empty \
                 -g $NIX_BUILD_GROUP_NAME -G $NIX_BUILD_GROUP_NAME \
-                -M -N -r -s $(which nologin) $username
+                -M -N -r -s $(which nologin) $username -u $uid
     else
         actual_uid=`grep "^$username" /etc/passwd | awk -F':' '{print $3}'`
         if [ "$actual_uid" -ne "$uid" ]; then
@@ -506,6 +506,7 @@ EOF
         else
             row "            Exists" "Yes"
         fi
+    fi
 }
 
 create_build_users() {
@@ -744,7 +745,7 @@ Description=Nix daemon
 
 [Service]
 Environment=SSL_CERT_FILE=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt
-ExecStart=/nix/var/nix/profiles/default/bin/nix-daemon $EXTRA_OPTS
+ExecStart=/nix/var/nix/profiles/default/bin/nix-daemon \$EXTRA_OPTS
 IgnoreSIGPIPE=false
 KillMode=process
 
