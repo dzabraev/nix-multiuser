@@ -81,11 +81,11 @@ uninstall_directions() {
     if [ -e "$NIX_SERVICE_CONFIG" ]; then
         step=$((step + 1))
         cat <<EOF
-$step. Delete $NIX_SERVICE_CONFIG
+$step.
 
   sudo systemctl stop nix
   sudo systemctl disable nix
-  sudo rm NIX_SERVICE_CONFIG
+  sudo rm $NIX_SERVICE_CONFIG
 
 EOF
     fi
