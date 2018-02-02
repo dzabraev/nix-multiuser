@@ -1,0 +1,16 @@
+#!/bin/bash
+
+set -eu
+
+system="x86_64-linux"
+
+nix_version="1.11.16"
+url="https://nixos.org/releases/nix/nix-${nix_version}/nix-${nix_version}-$system.tar.bz2"
+nix_deps_archieve="nix-${nix_version}-$system.tar.bz2"
+nix_deps_dir="nix-${nix_version}-$system"
+
+wget $url
+tar xvjf $nix_deps_archieve
+
+ln -s $nix_deps_dir/.reginfo .reginfo
+ln -s $nix_deps_dir/store store
